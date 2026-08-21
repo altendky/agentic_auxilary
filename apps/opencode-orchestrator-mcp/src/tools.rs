@@ -90,6 +90,65 @@ enum PermissionPreflightMode {
     RespondPermissionContinuation,
 }
 
+#[derive(Debug, Default)]
+struct SessionLineageResolver {
+    sessions_by_id: HashMap<String, opencode_rs::types::session::Session>,
+    eligible_depth_by_owner: HashMap<String, usize>,
+}
+
+impl SessionLineageResolver {
+    async fn eligible_owner_depth(
+        &mut self,
+        client: &opencode_rs::Client,
+        root_session_id: &str,
+        owner_session_id: &str,
+    ) -> Result<Option<usize>, OpencodeError> {
+        if owner_session_id == root_session_id {
+            return Ok(Some(0));
+        }
+
+        if let Some(depth) = self.eligible_depth_by_owner.get(owner_session_id) {
+            return Ok(Some(*depth));
+        }
+
+        let mut visited = HashSet::from([owner_session_id.to_string()]);
+        let mut current_session_id = owner_session_id.to_string();
+        let mut depth = 0_usize;
+
+        loop {
+            let session = if let Some(session) = self.sessions_by_id.get(&current_session_id) {
+                session.clone()
+            } else {
+                match client.sessions().get(&current_session_id).await {
+                    Ok(session) => {
+                        self.sessions_by_id
+                            .insert(current_session_id.clone(), session.clone());
+                        session
+                    }
+                    Err(error) if error.is_not_found() => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            };
+
+            let Some(parent_session_id) = session.parent_id else {
+                return Ok(None);
+            };
+            depth = depth.saturating_add(1);
+
+            if parent_session_id == root_session_id {
+                self.eligible_depth_by_owner
+                    .insert(owner_session_id.to_string(), depth);
+                return Ok(Some(depth));
+            }
+
+            if !visited.insert(parent_session_id.clone()) {
+                return Ok(None);
+            }
+            current_session_id = parent_session_id;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CommandTranscriptWindow {
     command_message_id: String,
