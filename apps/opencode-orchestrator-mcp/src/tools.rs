@@ -2784,7 +2784,7 @@ impl Tool for RespondQuestionTool {
 After replying, continues monitoring the session and returns when complete or when another interruption is required.
 
 Parameters:
-- session_id: Session with pending question
+- session_id: Monitored root session; the question may belong to it or an eligible descendant
 - action: "reply" or "reject"
 - answers: Required when action=reply; one list per question"#;
 
@@ -2805,6 +2805,7 @@ Parameters:
                 .map_err(|e| ToolError::Internal(e.to_string()))?;
 
             let client = server.client();
+            let mut lineage = SessionLineageResolver::default();
             let mut pending = client
                 .question()
                 .list()
@@ -2823,19 +2824,73 @@ Parameters:
                     })?;
 
                 let question = pending.remove(idx);
-                if question.session_id != input.session_id {
+                let owner_depth = lineage
+                    .eligible_owner_depth(client, &input.session_id, &question.session_id)
+                    .await
+                    .map_err(|error| {
+                        ToolError::Internal(format!(
+                            "Failed to verify question request '{req_id}' owner ancestry: {error}"
+                        ))
+                    })?;
+                if owner_depth.is_none() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Question request '{req_id}' belongs to session '{}', not '{}'.",
+                        "Question request '{req_id}' belongs to session '{}', which is not session '{}' or an eligible descendant.",
                         question.session_id, input.session_id
                     )));
                 }
 
                 question
             } else {
-                let mut questions: Vec<_> = pending
-                    .into_iter()
-                    .filter(|question| question.session_id == input.session_id)
-                    .collect();
+                let mut questions = Vec::new();
+                let mut unresolved = Vec::new();
+                for question in pending {
+                    match lineage
+                        .eligible_owner_depth(client, &input.session_id, &question.session_id)
+                        .await
+                    {
+                        Ok(Some(owner_depth)) => questions.push((owner_depth, question)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                root_session_id = %input.session_id,
+                                owner_session_id = %question.session_id,
+                                error = %error,
+                                "failed to verify question owner during discovery"
+                            );
+                            unresolved.push((
+                                question.session_id,
+                                question.id,
+                                error.to_string(),
+                            ));
+                        }
+                    }
+                }
+                unresolved.sort_by(|left, right| {
+                    left.0
+                        .cmp(&right.0)
+                        .then_with(|| left.1.cmp(&right.1))
+                });
+                if !unresolved.is_empty() {
+                    let details = unresolved
+                        .iter()
+                        .map(|(owner_session_id, request_id, error)| {
+                            format!(
+                                "request '{request_id}' owned by session '{owner_session_id}': {error}"
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(ToolError::Internal(format!(
+                        "Unable to safely discover a pending question for root session '{}': request ancestry could not be verified ({details}). Retry after the OpenCode session endpoint recovers, or provide question_request_id returned by run.",
+                        input.session_id
+                    )));
+                }
+                questions.sort_by(|(left_depth, left), (right_depth, right)| {
+                    left_depth
+                        .cmp(right_depth)
+                        .then_with(|| left.session_id.cmp(&right.session_id))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
 
                 match questions.as_slice() {
                     [] => {
@@ -2844,11 +2899,11 @@ Parameters:
                             input.session_id
                         )));
                     }
-                    [_single] => questions.swap_remove(0),
+                    [_single] => questions.swap_remove(0).1,
                     multiple => {
                         let ids = multiple
                             .iter()
-                            .map(|question| question.id.as_str())
+                            .map(|(_, question)| question.id.as_str())
                             .collect::<Vec<_>>()
                             .join(", ");
                         return Err(ToolError::InvalidInput(format!(
