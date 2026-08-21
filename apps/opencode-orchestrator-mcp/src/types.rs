@@ -511,7 +511,7 @@ impl TextFormat for ListAgentsOutput {
 /// Input for the `respond_permission` tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RespondPermissionInput {
-    /// Session ID with pending permission
+    /// Monitored root session ID. The permission may belong to this session or an eligible descendant.
     pub session_id: String,
 
     /// Permission request ID to respond to (returned by `run` when `status=permission_required`).
