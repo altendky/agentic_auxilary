@@ -36,6 +36,7 @@ use support::permission_fixture;
 use support::permission_fixture_with_metadata;
 use support::permission_patch_file_array_bad_request_fixture;
 use support::session_fixture;
+use support::session_fixture_with_parent;
 use support::short_timeout_test_orchestrator_server;
 use support::status_v2_busy;
 use support::status_v2_idle;

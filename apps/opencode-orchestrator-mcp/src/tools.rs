@@ -55,6 +55,7 @@ use opencode_rs::types::message::ToolState;
 use opencode_rs::types::new_message_id;
 use opencode_rs::types::permission::PermissionReply as ApiPermissionReply;
 use opencode_rs::types::permission::PermissionReplyRequest;
+use opencode_rs::types::permission::PermissionRequest;
 use opencode_rs::types::question::QuestionReply;
 use opencode_rs::types::question::QuestionRequest;
 use opencode_rs::types::session::CreateSessionRequest;
