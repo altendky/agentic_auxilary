@@ -90,6 +90,48 @@ enum PermissionPreflightMode {
     RespondPermissionContinuation,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BlockerDetectionSource {
+    Preflight(PermissionPreflightMode),
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CallerResponseBlockerKind {
+    Permission,
+    Question,
+}
+
+#[derive(Clone, Debug)]
+enum CallerResponseBlockerPayload {
+    Permission(PermissionRequest),
+    Question(QuestionRequest),
+}
+
+#[derive(Clone, Debug)]
+struct CallerResponseBlocker {
+    root_session_id: String,
+    owner_session_id: String,
+    owner_depth: usize,
+    request_id: String,
+    kind: CallerResponseBlockerKind,
+    payload: CallerResponseBlockerPayload,
+}
+
+#[derive(Clone, Debug)]
+enum BlockerScanResult {
+    Found(Box<CallerResponseBlocker>),
+    Clear,
+    Inconclusive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OwnerEligibility {
+    Eligible(usize),
+    Ineligible,
+    Inconclusive,
+}
+
 #[derive(Debug, Default)]
 struct SessionLineageResolver {
     sessions_by_id: HashMap<String, opencode_rs::types::session::Session>,
@@ -146,6 +188,179 @@ impl SessionLineageResolver {
             }
             current_session_id = parent_session_id;
         }
+    }
+}
+
+fn compare_caller_response_blockers(
+    left: &CallerResponseBlocker,
+    right: &CallerResponseBlocker,
+) -> std::cmp::Ordering {
+    let kind_rank = |kind| match kind {
+        CallerResponseBlockerKind::Permission => 0_u8,
+        CallerResponseBlockerKind::Question => 1_u8,
+    };
+
+    kind_rank(left.kind)
+        .cmp(&kind_rank(right.kind))
+        .then_with(|| left.owner_depth.cmp(&right.owner_depth))
+        .then_with(|| left.owner_session_id.cmp(&right.owner_session_id))
+        .then_with(|| left.request_id.cmp(&right.request_id))
+}
+
+async fn eligible_owner_depth_for_scan(
+    lineage: &mut SessionLineageResolver,
+    client: &opencode_rs::Client,
+    root_session_id: &str,
+    owner_session_id: &str,
+) -> OwnerEligibility {
+    match lineage
+        .eligible_owner_depth(client, root_session_id, owner_session_id)
+        .await
+    {
+        Ok(Some(depth)) => OwnerEligibility::Eligible(depth),
+        Ok(None) => OwnerEligibility::Ineligible,
+        Err(error) => {
+            tracing::warn!(
+                root_session_id,
+                owner_session_id,
+                error = %error,
+                "failed to verify pending blocker owner ancestry"
+            );
+            OwnerEligibility::Inconclusive
+        }
+    }
+}
+
+async fn scan_pending_caller_response_blocker(
+    client: &opencode_rs::Client,
+    root_session_id: &str,
+    lineage: &mut SessionLineageResolver,
+    source: BlockerDetectionSource,
+    warnings: &mut Vec<String>,
+) -> Result<BlockerScanResult, ToolError> {
+    let mut inconclusive = false;
+    let permissions = match client.permissions().list().await {
+        Ok(permissions) => permissions,
+        Err(error) => match source {
+            BlockerDetectionSource::Preflight(permission_mode) if error.is_validation_error() => {
+                match permission_mode {
+                    PermissionPreflightMode::RespondPermissionContinuation => {
+                        tracing::warn!(
+                            session_id = %root_session_id,
+                            error = %error,
+                            "failed to list permissions during respond_permission continuation; falling back to polling"
+                        );
+                        warnings.push(format!(
+                            "Permission refresh failed after reply ({error}); permission state could not be listed and may be stale or malformed. Continuing with polling fallback."
+                        ));
+                    }
+                    PermissionPreflightMode::Strict => {
+                        tracing::warn!(
+                            session_id = %root_session_id,
+                            error = %error,
+                            "failed to list permissions during run preflight; continuing without permission preflight"
+                        );
+                        warnings.push(
+                            "Permission state could not be listed during preflight (HTTP 400). Permission state may be stale or malformed; pending permissions may be stale or undiscoverable."
+                                .to_string(),
+                        );
+                    }
+                }
+                inconclusive = true;
+                Vec::new()
+            }
+            BlockerDetectionSource::Preflight(_) => {
+                return Err(ToolError::Internal(format!(
+                    "Failed to list permissions: {error}"
+                )));
+            }
+            BlockerDetectionSource::Fallback => {
+                tracing::warn!(
+                    session_id = %root_session_id,
+                    error = %error,
+                    "failed to list permissions during blocker scan fallback"
+                );
+                inconclusive = true;
+                Vec::new()
+            }
+        },
+    };
+
+    let mut blockers = Vec::new();
+    for permission in permissions {
+        match eligible_owner_depth_for_scan(
+            lineage,
+            client,
+            root_session_id,
+            &permission.session_id,
+        )
+        .await
+        {
+            OwnerEligibility::Eligible(owner_depth) => {
+                blockers.push(CallerResponseBlocker {
+                    root_session_id: root_session_id.to_string(),
+                    owner_session_id: permission.session_id.clone(),
+                    owner_depth,
+                    request_id: permission.id.clone(),
+                    kind: CallerResponseBlockerKind::Permission,
+                    payload: CallerResponseBlockerPayload::Permission(permission),
+                });
+            }
+            OwnerEligibility::Ineligible => {}
+            OwnerEligibility::Inconclusive => inconclusive = true,
+        }
+    }
+    blockers.sort_by(compare_caller_response_blockers);
+    if let Some(blocker) = blockers.into_iter().next() {
+        return Ok(BlockerScanResult::Found(Box::new(blocker)));
+    }
+
+    let questions = match client.question().list().await {
+        Ok(questions) => questions,
+        Err(error) => match source {
+            BlockerDetectionSource::Preflight(_) => {
+                return Err(ToolError::Internal(format!(
+                    "Failed to list questions: {error}"
+                )));
+            }
+            BlockerDetectionSource::Fallback => {
+                tracing::warn!(
+                    session_id = %root_session_id,
+                    error = %error,
+                    "failed to list questions during blocker scan fallback"
+                );
+                inconclusive = true;
+                Vec::new()
+            }
+        },
+    };
+
+    let mut blockers = Vec::new();
+    for question in questions {
+        match eligible_owner_depth_for_scan(lineage, client, root_session_id, &question.session_id)
+            .await
+        {
+            OwnerEligibility::Eligible(owner_depth) => {
+                blockers.push(CallerResponseBlocker {
+                    root_session_id: root_session_id.to_string(),
+                    owner_session_id: question.session_id.clone(),
+                    owner_depth,
+                    request_id: question.id.clone(),
+                    kind: CallerResponseBlockerKind::Question,
+                    payload: CallerResponseBlockerPayload::Question(question),
+                });
+            }
+            OwnerEligibility::Ineligible => {}
+            OwnerEligibility::Inconclusive => inconclusive = true,
+        }
+    }
+    blockers.sort_by(compare_caller_response_blockers);
+    if let Some(blocker) = blockers.into_iter().next() {
+        Ok(BlockerScanResult::Found(Box::new(blocker)))
+    } else if inconclusive {
+        Ok(BlockerScanResult::Inconclusive)
+    } else {
+        Ok(BlockerScanResult::Clear)
     }
 }
 
@@ -596,45 +811,30 @@ impl OrchestratorRunTool {
         }
     }
 
-    async fn preflight_pending_permission(
-        client: &opencode_rs::Client,
-        session_id: &str,
-        mode: PermissionPreflightMode,
-        warnings: &mut Vec<String>,
-    ) -> Result<Option<opencode_rs::types::permission::PermissionRequest>, ToolError> {
-        match client.permissions().list().await {
-            Ok(pending_permissions) => Ok(pending_permissions
-                .into_iter()
-                .find(|permission| permission.session_id == session_id)),
-            Err(error) if error.is_validation_error() => {
-                match mode {
-                    PermissionPreflightMode::RespondPermissionContinuation => {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            error = %error,
-                            "failed to list permissions during respond_permission continuation; falling back to polling"
-                        );
-                        warnings.push(format!(
-                            "Permission refresh failed after reply ({error}); permission state could not be listed and may be stale or malformed. Continuing with polling fallback."
-                        ));
-                    }
-                    PermissionPreflightMode::Strict => {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            error = %error,
-                            "failed to list permissions during run preflight; continuing without permission preflight"
-                        );
-                        warnings.push(
-                            "Permission state could not be listed during preflight (HTTP 400). Permission state may be stale or malformed; pending permissions may be stale or undiscoverable."
-                                .to_string(),
-                        );
-                    }
-                }
-                Ok(None)
-            }
-            Err(error) => Err(ToolError::Internal(format!(
-                "Failed to list permissions: {error}"
-            ))),
+    fn caller_response_blocker_output(
+        blocker: CallerResponseBlocker,
+        partial_response: Option<String>,
+        warnings: Vec<String>,
+    ) -> OrchestratorRunOutput {
+        match blocker.payload {
+            CallerResponseBlockerPayload::Permission(permission) => OrchestratorRunOutput {
+                session_id: blocker.root_session_id,
+                status: RunStatus::PermissionRequired,
+                response: None,
+                partial_response,
+                permission_request_id: Some(permission.id),
+                permission_type: Some(permission.permission),
+                permission_patterns: permission.patterns,
+                question_request_id: None,
+                questions: vec![],
+                warnings,
+            },
+            CallerResponseBlockerPayload::Question(question) => Self::question_required_output(
+                blocker.root_session_id,
+                partial_response,
+                &question,
+                warnings,
+            ),
         }
     }
 
@@ -750,6 +950,7 @@ impl OrchestratorRunTool {
         tracing::info!(session_id = %session_id, "run: session resolved");
 
         let mut warnings = Vec::new();
+        let mut lineage = SessionLineageResolver::default();
 
         // 2. Check if session is already idle (for resume-only case)
         let status = client
@@ -760,50 +961,30 @@ impl OrchestratorRunTool {
 
         let is_idle = matches!(status, SessionStatusInfo::Idle);
 
-        // 3. Check for pending permissions before doing anything else
-        if let Some(perm) = Self::preflight_pending_permission(
+        // 3. Check for pending caller-response blockers before doing anything else
+        match scan_pending_caller_response_blocker(
             client,
             &session_id,
-            permission_preflight_mode,
+            &mut lineage,
+            BlockerDetectionSource::Preflight(permission_preflight_mode),
             &mut warnings,
         )
         .await?
         {
-            tracing::info!(
-                session_id = %session_id,
-                permission_type = %perm.permission,
-                "run: pending permission found"
-            );
-            return Ok(RunOutcome::without_tokens(OrchestratorRunOutput {
-                session_id,
-                status: RunStatus::PermissionRequired,
-                response: None,
-                partial_response: None,
-                permission_request_id: Some(perm.id),
-                permission_type: Some(perm.permission),
-                permission_patterns: perm.patterns,
-                question_request_id: None,
-                questions: vec![],
-                warnings,
-            }));
+            BlockerScanResult::Found(blocker) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    owner_session_id = %blocker.owner_session_id,
+                    request_id = %blocker.request_id,
+                    blocker_kind = ?blocker.kind,
+                    "run: pending caller-response blocker found"
+                );
+                return Ok(RunOutcome::without_tokens(
+                    Self::caller_response_blocker_output(*blocker, None, warnings),
+                ));
+            }
+            BlockerScanResult::Clear | BlockerScanResult::Inconclusive => {}
         }
-
-        let pending_questions = client
-            .question()
-            .list()
-            .await
-            .map_err(|e| ToolError::Internal(format!("Failed to list questions: {e}")))?;
-
-        if let Some(question) = pending_questions
-            .into_iter()
-            .find(|question| question.session_id == session_id)
-        {
-            tracing::info!(session_id = %session_id, question_id = %question.id, "run: pending question found");
-            return Ok(RunOutcome::without_tokens(Self::question_required_output(
-                session_id, None, &question, warnings,
-            )));
-        }
-
         // 4. If no message/command and session is idle, just return current state
         // Uses finalize_completed to get retry logic for message extraction
         if message.is_none() && input.command.is_none() && is_idle && !wait_for_activity {
