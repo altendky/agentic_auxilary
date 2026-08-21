@@ -551,7 +551,9 @@ pub enum QuestionAction {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RespondQuestionInput {
+    /// Monitored root session ID. The question may belong to this session or an eligible descendant.
     pub session_id: String,
+    /// Question request ID to respond to (returned by `run` when `status=question_required`).
     #[serde(default)]
     pub question_request_id: Option<String>,
     pub action: QuestionAction,
