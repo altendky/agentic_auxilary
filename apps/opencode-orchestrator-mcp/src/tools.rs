@@ -3005,6 +3005,45 @@ mod tests {
     use super::*;
     use agentic_tools_core::Tool;
 
+    fn test_blocker(
+        kind: CallerResponseBlockerKind,
+        owner_session_id: &str,
+        owner_depth: usize,
+        request_id: &str,
+    ) -> CallerResponseBlocker {
+        let payload = match kind {
+            CallerResponseBlockerKind::Permission => {
+                CallerResponseBlockerPayload::Permission(PermissionRequest {
+                    id: request_id.to_string(),
+                    session_id: owner_session_id.to_string(),
+                    permission: "file.read".to_string(),
+                    patterns: vec![],
+                    metadata: None,
+                    always: vec![],
+                    tool: None,
+                })
+            }
+            CallerResponseBlockerKind::Question => {
+                CallerResponseBlockerPayload::Question(QuestionRequest {
+                    id: request_id.to_string(),
+                    session_id: owner_session_id.to_string(),
+                    questions: vec![],
+                    tool: None,
+                    extra: serde_json::Value::Null,
+                })
+            }
+        };
+
+        CallerResponseBlocker {
+            root_session_id: "root".to_string(),
+            owner_session_id: owner_session_id.to_string(),
+            owner_depth,
+            request_id: request_id.to_string(),
+            kind,
+            payload,
+        }
+    }
+
     #[test]
     fn tool_names_are_short() {
         assert_eq!(<OrchestratorRunTool as Tool>::NAME, "run");
@@ -3013,6 +3052,74 @@ mod tests {
         assert_eq!(<ListCommandsTool as Tool>::NAME, "list_commands");
         assert_eq!(<RespondPermissionTool as Tool>::NAME, "respond_permission");
         assert_eq!(<RespondQuestionTool as Tool>::NAME, "respond_question");
+    }
+
+    #[test]
+    fn caller_response_blocker_order_prefers_permission_before_question() {
+        let mut blockers = [
+            test_blocker(CallerResponseBlockerKind::Question, "root", 0, "question"),
+            test_blocker(
+                CallerResponseBlockerKind::Permission,
+                "deep-child",
+                3,
+                "permission",
+            ),
+        ];
+
+        blockers.sort_by(compare_caller_response_blockers);
+        assert_eq!(blockers[0].kind, CallerResponseBlockerKind::Permission);
+    }
+
+    #[test]
+    fn caller_response_blocker_order_prefers_shallower_owner() {
+        let mut blockers = [
+            test_blocker(
+                CallerResponseBlockerKind::Permission,
+                "deep",
+                2,
+                "request-1",
+            ),
+            test_blocker(
+                CallerResponseBlockerKind::Permission,
+                "shallow",
+                1,
+                "request-2",
+            ),
+        ];
+
+        blockers.sort_by(compare_caller_response_blockers);
+        assert_eq!(blockers[0].owner_session_id, "shallow");
+    }
+
+    #[test]
+    fn caller_response_blocker_order_uses_owner_then_request_id() {
+        let mut blockers = [
+            test_blocker(
+                CallerResponseBlockerKind::Question,
+                "owner-b",
+                1,
+                "request-a",
+            ),
+            test_blocker(
+                CallerResponseBlockerKind::Question,
+                "owner-a",
+                1,
+                "request-z",
+            ),
+            test_blocker(
+                CallerResponseBlockerKind::Question,
+                "owner-a",
+                1,
+                "request-a",
+            ),
+        ];
+
+        blockers.sort_by(compare_caller_response_blockers);
+        assert_eq!(blockers[0].owner_session_id, "owner-a");
+        assert_eq!(blockers[0].request_id, "request-a");
+        assert_eq!(blockers[1].owner_session_id, "owner-a");
+        assert_eq!(blockers[1].request_id, "request-z");
+        assert_eq!(blockers[2].owner_session_id, "owner-b");
     }
 
     #[test]

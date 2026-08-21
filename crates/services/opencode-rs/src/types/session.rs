@@ -410,6 +410,36 @@ mod tests {
     }
 
     #[test]
+    fn session_parent_id_deserializes_uppercase_id_suffix() {
+        let json = r#"{
+            "id": "s1",
+            "slug": "s1",
+            "parentID": "s0"
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.parent_id.as_deref(), Some("s0"));
+    }
+
+    #[test]
+    fn session_parent_id_serializes_with_canonical_camel_case() {
+        let session: Session = serde_json::from_str(
+            r#"{
+                "id": "s1",
+                "slug": "s1",
+                "parentID": "s0"
+            }"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(session).unwrap();
+
+        assert_eq!(
+            value.get("parentId").and_then(serde_json::Value::as_str),
+            Some("s0")
+        );
+        assert!(value.get("parentID").is_none());
+    }
+
+    #[test]
     fn parse_legacy_status_shape_is_rejected() {
         let json = r#"{"busy": true, "activeSessionId": "s1"}"#;
         let resp: Result<HashMap<String, SessionStatusInfo>, _> = serde_json::from_str(json);
