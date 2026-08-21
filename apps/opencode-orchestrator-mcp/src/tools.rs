@@ -1952,7 +1952,7 @@ impl Tool for RespondPermissionTool {
 After responding, continues monitoring the session and returns when complete or when another permission is required.
 
 Parameters:
-- session_id: Session with pending permission
+- session_id: Monitored root session; the permission may belong to it or an eligible descendant
 - reply: "once" (allow this request), "always" (allow for matching patterns), or "reject" (deny)
 - message: Optional message to include with reply"#;
 
@@ -1974,6 +1974,7 @@ Parameters:
 
                 let client = server.client();
                 let mut pre_warnings: Vec<String> = Vec::new();
+                let mut lineage = SessionLineageResolver::default();
 
                 let (permission_request_id, permission_type, permission_patterns) =
                     if let Some(req_id) = input.permission_request_id.as_deref() {
@@ -1988,10 +1989,21 @@ Parameters:
                                 })?;
 
                                 let perm = pending.remove(idx);
-
-                                if perm.session_id != input.session_id {
+                                let owner_depth = lineage
+                                    .eligible_owner_depth(
+                                        client,
+                                        &input.session_id,
+                                        &perm.session_id,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        ToolError::Internal(format!(
+                                            "Failed to verify permission request '{req_id}' owner ancestry: {error}"
+                                        ))
+                                    })?;
+                                if owner_depth.is_none() {
                                     return Err(ToolError::InvalidInput(format!(
-                                        "Permission request '{req_id}' belongs to session '{}', not '{}'.",
+                                        "Permission request '{req_id}' belongs to session '{}', which is not session '{}' or an eligible descendant.",
                                         perm.session_id, input.session_id
                                     )));
                                 }
@@ -2033,10 +2045,60 @@ Parameters:
                             }
                         };
 
-                        let mut perms: Vec<_> = pending
-                            .into_iter()
-                            .filter(|p| p.session_id == input.session_id)
-                            .collect();
+                        let mut perms = Vec::new();
+                        let mut unresolved = Vec::new();
+                        for permission in pending {
+                            match lineage
+                                .eligible_owner_depth(
+                                    client,
+                                    &input.session_id,
+                                    &permission.session_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(owner_depth)) => perms.push((owner_depth, permission)),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        root_session_id = %input.session_id,
+                                        owner_session_id = %permission.session_id,
+                                        error = %error,
+                                        "failed to verify permission owner during discovery"
+                                    );
+                                    unresolved.push((
+                                        permission.session_id,
+                                        permission.id,
+                                        error.to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        unresolved.sort_by(|left, right| {
+                            left.0
+                                .cmp(&right.0)
+                                .then_with(|| left.1.cmp(&right.1))
+                        });
+                        if !unresolved.is_empty() {
+                            let details = unresolved
+                                .iter()
+                                .map(|(owner_session_id, request_id, error)| {
+                                    format!(
+                                        "request '{request_id}' owned by session '{owner_session_id}': {error}"
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(ToolError::Internal(format!(
+                                "Unable to safely discover a pending permission for root session '{}': request ancestry could not be verified ({details}). Retry after the OpenCode session endpoint recovers, or provide permission_request_id returned by run.",
+                                input.session_id
+                            )));
+                        }
+                        perms.sort_by(|(left_depth, left), (right_depth, right)| {
+                            left_depth
+                                .cmp(right_depth)
+                                .then_with(|| left.session_id.cmp(&right.session_id))
+                                .then_with(|| left.id.cmp(&right.id))
+                        });
 
                         match perms.as_slice() {
                             [] => {
@@ -2047,13 +2109,13 @@ Parameters:
                                 )));
                             }
                             [_single] => {
-                                let perm = perms.swap_remove(0);
+                                let (_, perm) = perms.swap_remove(0);
                                 (perm.id, perm.permission, perm.patterns)
                             }
                             multiple => {
                                 let ids = multiple
                                     .iter()
-                                    .map(|p| p.id.as_str())
+                                    .map(|(_, permission)| permission.id.as_str())
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 return Err(ToolError::InvalidInput(format!(
