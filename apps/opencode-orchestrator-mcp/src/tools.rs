@@ -2210,7 +2210,8 @@ impl Tool for RespondQuestionTool {
 After replying, continues monitoring the session and returns when complete or when another interruption is required.
 
 Parameters:
-- session_id: Session with pending question
+- session_id: Monitored root session; the question may belong to it or an eligible descendant
+- question_request_id: Request ID returned by run. Required for descendant-owned questions; omit only for root-owned compatibility discovery
 - action: "reply" or "reject"
 - answers: Required when action=reply; one list per question"#;
 
@@ -2231,6 +2232,7 @@ Parameters:
                 .map_err(|e| ToolError::Internal(e.to_string()))?;
 
             let client = server.client();
+            let mut lineage = SessionLineageResolver::default();
             let mut pending = client
                 .question()
                 .list()
@@ -2249,19 +2251,27 @@ Parameters:
                     })?;
 
                 let question = pending.remove(idx);
-                if question.session_id != input.session_id {
+                let owner_depth = lineage
+                    .owner_depth_from_root(client, &input.session_id, &question.session_id)
+                    .await
+                    .map_err(|error| {
+                        ToolError::Internal(format!(
+                            "Failed to verify question request '{req_id}' owner ancestry: {error}"
+                        ))
+                    })?;
+                if owner_depth.is_none() {
                     return Err(ToolError::InvalidInput(format!(
-                        "Question request '{req_id}' belongs to session '{}', not '{}'.",
+                        "Question request '{req_id}' belongs to session '{}', which is not session '{}' or an eligible descendant.",
                         question.session_id, input.session_id
                     )));
                 }
 
                 question
             } else {
-                let mut questions: Vec<_> = pending
+                let mut questions = pending
                     .into_iter()
                     .filter(|question| question.session_id == input.session_id)
-                    .collect();
+                    .collect::<Vec<_>>();
 
                 match questions.as_slice() {
                     [] => {

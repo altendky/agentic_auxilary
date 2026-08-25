@@ -180,10 +180,10 @@ impl TextFormat for OrchestratorRunOutput {
                 let _ = writeln!(out, "  custom: {}", question.custom);
             }
             out.push_str(
-                "\nTo respond: orchestrator_respond_question(session_id, action, answers)\n",
+                "\nTo respond: orchestrator_respond_question(session_id, question_request_id=<Request ID>, action, answers)\n",
             );
             out.push_str("  action options: reply | reject\n");
-            out.push_str("  tip: include question_request_id=<Request ID> when provided\n");
+            out.push_str("  omission is supported only for root-owned compatibility discovery\n");
         }
 
         // Response content
@@ -551,7 +551,10 @@ pub enum QuestionAction {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RespondQuestionInput {
+    /// Monitored root session ID. The question may belong to this session or an eligible descendant.
     pub session_id: String,
+    /// Question request ID returned by `run` when `status=question_required`.
+    /// Required for descendant-owned questions. Omit only for root-owned compatibility discovery.
     #[serde(default)]
     pub question_request_id: Option<String>,
     pub action: QuestionAction,
