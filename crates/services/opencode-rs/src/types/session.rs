@@ -22,7 +22,7 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Parent session ID (for forked sessions).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "parentID")]
     pub parent_id: Option<String>,
     /// Session summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
