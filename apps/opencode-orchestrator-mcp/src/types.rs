@@ -154,9 +154,11 @@ impl TextFormat for OrchestratorRunOutput {
             }
             // NOTE: Keep the `orchestrator_*` prefix in user-facing instructions because OpenCode
             // displays tool names as `<server>_<tool>` (server name is "orchestrator").
-            out.push_str("\nTo respond: orchestrator_respond_permission(session_id, reply)\n");
+            out.push_str(
+                "\nTo respond: orchestrator_respond_permission(session_id, permission_request_id=<Request ID>, reply)\n",
+            );
             out.push_str("  reply options: once | always | reject\n");
-            out.push_str("  tip: include permission_request_id=<Request ID> when provided\n");
+            out.push_str("  omission is supported only for root-owned compatibility discovery\n");
         }
 
         if self.status == RunStatus::QuestionRequired {
@@ -511,11 +513,11 @@ impl TextFormat for ListAgentsOutput {
 /// Input for the `respond_permission` tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RespondPermissionInput {
-    /// Session ID with pending permission
+    /// Monitored root session ID. The permission may belong to this session or an eligible descendant.
     pub session_id: String,
 
-    /// Permission request ID to respond to (returned by `run` when `status=permission_required`).
-    /// Recommended when present to avoid replying to the wrong request.
+    /// Permission request ID returned by `run` when `status=permission_required`.
+    /// Required for descendant-owned permissions. Omit only for root-owned compatibility discovery.
     #[serde(default)]
     pub permission_request_id: Option<String>,
 
